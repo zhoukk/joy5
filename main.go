@@ -1,8 +1,10 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
+	"time"
 
 	"github.com/zhoukk/joy5/av"
 	"github.com/zhoukk/joy5/format"
@@ -11,8 +13,12 @@ import (
 )
 
 func main() {
-	dst := "out.mp4"
-	src := "rtsp://admin:xxx@192.168.1.64//Streaming/Channels/1"
+	var src string
+	var dst string
+
+	flag.StringVar(&src, "s", "rtsp://admin:xxx@192.168.1.64//Streaming/Channels/1", "rtsp src")
+	flag.StringVar(&dst, "d", "out.mp4", "mp4 output")
+	flag.Parse()
 
 	var rtspc *rtsp.Client
 	rtspc, err := rtsp.Dial(src)
@@ -45,14 +51,17 @@ func main() {
 		}
 	}()
 
-	for i := 0; i < 200; i++ {
+	for {
 		var pkt av.Packet
 		if pkt, err = rtspc.ReadPacket(); err != nil {
 			log.Fatal(err)
 		}
+		log.Println(pkt.CTime, pkt.Time)
 		if err = m.WritePacket(pkt); err != nil {
 			log.Fatal(err)
 		}
-
+		if pkt.Time > 10*time.Second {
+			break
+		}
 	}
 }
