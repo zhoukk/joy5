@@ -12,15 +12,33 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nareix/joy5/format/flv"
+	"github.com/zhoukk/joy5/format/flv"
+	"github.com/zhoukk/joy5/format/mp4"
+	"github.com/zhoukk/joy5/format/rtsp"
 
-	"github.com/nareix/joy5/av"
-	"github.com/nareix/joy5/format/rtmp"
+	"github.com/zhoukk/joy5/av"
+	"github.com/zhoukk/joy5/format/rtmp"
 )
 
 type dummyCloser struct{}
 
 func (c dummyCloser) Close() error {
+	return nil
+}
+
+type Mp4WriterCloser struct {
+	io.Closer
+	*mp4.Muxer
+}
+
+func (c Mp4WriterCloser) Close() error {
+	if err := c.Muxer.WriteTrailer(); err != nil {
+		return err
+	}
+	if err := c.Closer.Close(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -38,7 +56,6 @@ type Writer struct {
 	io.Closer
 	NetConn  net.Conn
 	Rtmp     *rtmp.Conn
-	Flv      *flv.Muxer
 	IsRemote bool
 }
 
@@ -55,6 +72,7 @@ type URLOpener struct {
 	OnNewRtmpClient func(c *rtmp.Client)
 	OnNewFlvDemuxer func(r *flv.Demuxer)
 	OnNewFlvMuxer   func(w *flv.Muxer)
+	av.Streamer
 }
 
 func (o *URLOpener) StartRtmpServerWaitConn(u *url.URL) (c *rtmp.Conn, nc net.Conn, err error) {
@@ -107,13 +125,7 @@ func (o *URLOpener) newRtmpClient() *rtmp.Client {
 	return c
 }
 
-func (o *URLOpener) Create(url_ string) (w *Writer, err error) {
-	isServer := false
-	if strings.HasPrefix(url_, "@") {
-		isServer = true
-		url_ = url_[1:]
-	}
-
+func (o *URLOpener) Create(url_ string, streamer av.Streamer) (w *Writer, err error) {
 	var u *url.URL
 	if u, err = url.Parse(url_); err != nil {
 		return
@@ -121,56 +133,50 @@ func (o *URLOpener) Create(url_ string) (w *Writer, err error) {
 
 	switch u.Scheme {
 	case "rtmp", "rtmps":
-		if isServer {
-			var c *rtmp.Conn
-			var nc net.Conn
-			if c, nc, err = o.StartRtmpServerWaitConn(u); err != nil {
-				return
-			}
-			w = &Writer{
-				IsRemote:     true,
-				PacketWriter: c,
-				Closer:       nc,
-				Rtmp:         c,
-				NetConn:      nc,
-			}
+		rc := o.newRtmpClient()
+		var c *rtmp.Conn
+		var nc net.Conn
+		if c, nc, err = rc.Dial(url_, rtmp.PrepareWriting); err != nil {
 			return
-		} else {
-			rc := o.newRtmpClient()
-			var c *rtmp.Conn
-			var nc net.Conn
-			if c, nc, err = rc.Dial(url_, rtmp.PrepareWriting); err != nil {
-				return
-			}
-			if fn := o.OnNewRtmpConn; fn != nil {
-				fn(c)
-			}
-			w = &Writer{
-				IsRemote:     true,
-				PacketWriter: c,
-				Closer:       nc,
-				Rtmp:         c,
-				NetConn:      nc,
-			}
+		}
+		if fn := o.OnNewRtmpConn; fn != nil {
+			fn(c)
+		}
+		w = &Writer{
+			IsRemote:     true,
+			PacketWriter: c,
+			Closer:       nc,
+			Rtmp:         c,
+			NetConn:      nc,
 		}
 		return
 
 	default:
 		ext := path.Ext(u.Path)
+		var f *os.File
+		if f, err = os.Create(u.Path); err != nil {
+			return
+		}
 		switch ext {
 		case ".flv":
-			var f *os.File
-			if f, err = os.Create(u.Path); err != nil {
-				return
-			}
-			c := flv.NewMuxer(f)
+			c := flv.NewMuxer(NewStreamsWriteSeeker(f, streamer))
 			if fn := o.OnNewFlvMuxer; fn != nil {
 				fn(c)
 			}
 			w = &Writer{
-				PacketWriter: flv.NewMuxer(f),
+				PacketWriter: c,
 				Closer:       f,
-				Flv:          c,
+			}
+			return
+		case ".mp4":
+			var m *mp4.Muxer
+			m, err = mp4.NewMuxer(NewStreamsWriteSeeker(f, streamer))
+			if err != nil {
+				return nil, err
+			}
+			w = &Writer{
+				PacketWriter: m,
+				Closer:       Mp4WriterCloser{f, m},
 			}
 			return
 
@@ -194,7 +200,7 @@ func (o *URLOpener) Open(url_ string) (r *Reader, err error) {
 	}
 
 	switch u.Scheme {
-	case "rtmp", "rtmps":
+	case "rtmp":
 		if isServer {
 			var c *rtmp.Conn
 			var nc net.Conn
@@ -228,8 +234,18 @@ func (o *URLOpener) Open(url_ string) (r *Reader, err error) {
 			}
 			return
 		}
+	case "rtsp":
+		var clt *rtsp.Client
+		clt, err = rtsp.DialTimeout(url_, 3*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		r = &Reader{
+			PacketReader: clt,
+			Closer:       clt,
+			IsRemote:     true,
+		}
 		return
-
 	case "http", "https":
 		ext := path.Ext(u.Path)
 		switch ext {
@@ -278,5 +294,16 @@ func (o *URLOpener) Open(url_ string) (r *Reader, err error) {
 			err = ErrUnsupported(url_)
 			return
 		}
+	}
+}
+
+type StreamsWriteSeeker struct {
+	io.WriteSeeker
+	av.Streamer
+}
+
+func NewStreamsWriteSeeker(w io.WriteSeeker, s av.Streamer) *StreamsWriteSeeker {
+	return &StreamsWriteSeeker{
+		w, s,
 	}
 }

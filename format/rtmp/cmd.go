@@ -3,9 +3,9 @@ package rtmp
 import (
 	"fmt"
 
-	"github.com/nareix/joy5/av"
-	"github.com/nareix/joy5/format/flv"
-	"github.com/nareix/joy5/format/flv/flvio"
+	"github.com/zhoukk/joy5/av"
+	"github.com/zhoukk/joy5/format/flv"
+	"github.com/zhoukk/joy5/format/flv/flvio"
 )
 
 const (
